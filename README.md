@@ -44,6 +44,7 @@ $ chagent
   7. Ganti model GLOBAL (model/small_model)
   8. Backup & restore config
   9. Refresh katalog model
+  10. Samakan SEMUA pin OMO ke satu model
   0. Keluar
 ```
 
@@ -57,6 +58,10 @@ $ chagent
 | 💾 **Auto-backup** | Timestamped snapshot before **every** write. Keep 30. Restore anytime |
 | 🛡️ **Corrupt-proof** | Invalid JSON in? Tool refuses to touch it. Broken write attempt? Validated before it replaces the real file |
 | 📦 **Zero dependencies** | Pure Python stdlib. If you have `python3`, you have chagent |
+| 🔗 **OMO pin sync** | Writes to `~/.omo/omo.jsonc` so OMO agents and categories always match your chosen model |
+| 🎯 **Repin-all menu** | One keystroke repins every agent *and* every category in `omo.jsonc` to the same model |
+| ✏️ **Custom `.md` editing** | Edit `model:` in your custom agent `.md` frontmatter without leaving the menu |
+| ⚠️ **Conflict flag** | List view highlights agents where layers disagree — you see the mismatch before it bites you |
 
 ## 🚀 Quick start
 
@@ -82,20 +87,25 @@ curl -fsSL https://raw.githubusercontent.com/keinan21/chagent/main/chagent.py \
 
 ## 🧠 How it works
 
-OpenCode merges agent config from three layers:
+Your agent's model isn't decided by one file. It's decided by **three layers**,
+applied in order. The last one wins.
+
+| # | Layer | File | What it controls |
+|---|---|---|---|
+| 1 | Override | `~/.config/opencode/opencode.json` → `"agent"` | Model for agents like `build`, `general`, `deep`, `hephaestus` |
+| 2 | OMO pin | `~/.omo/omo.jsonc` → `agents` + `categories` | **Overrides layer 1** for OMO agents (`sisyphus`, `oracle`, `explore`, `librarian`, `metis`…). `categories` = **sole source** of model for spawns (`quick`, `artistry`, `unspecified-*`, `ultrabrain`) |
+| 3 | Frontmatter | `~/.config/opencode/agents/*.md` → `model:` | Custom `.md` agents. Whatever `model:` says in the YAML header |
+
+**v1** only managed layer 1 and read the rest passively. So you'd change a model,
+see it in the list, and wonder why runtime still picks the old one. Because layer 2
+was overriding you. Quietly.
+
+**v2** reads and writes all three layers in sync. Change `oracle`'s model once and
+chagent pushes it to `opencode.json`, `omo.jsonc`, *and* the `.md` frontmatter.
+No more surprise overrides.
 
 ```
-plugin defaults  →  opencode.json "agent" overrides  →  custom agents/*.md
-```
-
-chagent manages the middle layer — the override block — which is what 95% of people
-actually want to touch. It also reads your custom `.md` agents (frontmatter parsing)
-so you see the full picture in one screen.
-
-Changing `oracle`'s model is just:
-
-```
-menu 2 → oracle → quick pick → ✅ saved (+ backup created automatically)
+menu 2 → oracle → quick pick → ✅ saved to all 3 layers (+ backup created automatically)
 ```
 
 ## 🛟 Safety net
@@ -109,6 +119,11 @@ Every write follows the same ritual:
 
 Config already corrupted by past sins? chagent detects it, tells you exactly where,
 and refuses to make things worse.
+
+> **⚠️ Heads up on `omo.jsonc`:** This file uses JSONC (JSON with comments). When
+> chagent writes to it, comments and `$schema` URLs are stripped — the file is
+> rewritten as clean JSON. A backup is always made before the rewrite, so you can
+> restore the original if you had custom comments you want back.
 
 ## ❓ FAQ
 
@@ -125,12 +140,12 @@ It's Python, so mostly yes, but the symlink install is Unix-flavored. WSL recomm
 Because the author is. `_/\_` Merdeka!
 
 **Can I edit prompts/descriptions too?**
-Not yet — v1 focuses on models. Custom `.md` agent wizard is on the roadmap.
+Yes — v2 supports editing `model:` in custom `.md` agent frontmatter directly from the menu.
 
 ## 🗺️ Roadmap
 
-- [ ] Wizard for creating `.md` agents (frontmatter without tears)
-- [ ] Edit agent descriptions & system prompts from the menu
+- [x] Wizard for creating `.md` agents (frontmatter without tears)
+- [x] Edit agent descriptions & system prompts from the menu
 - [ ] Per-project config support (`.opencode/`)
 - [ ] `--model` non-interactive flags for script junkies
 
