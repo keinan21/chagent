@@ -3,8 +3,12 @@
 chagent — Manajer agent OhMyOpenCode / OpenCode
 Ganti model agent, preset cepat, backup otomatis. Menu interaktif, zero dependency.
 
-Config yang dikelola : ~/.config/opencode/opencode.json  (bagian "agent" + "model")
-Backup otomatis      : ~/.config/opencode/backups/
+Config yang dikelola (3 lapisan):
+  1. ~/.config/opencode/opencode.json   → bagian "agent" + "model" global
+  2. ~/.omo/omo.jsonc                   → pin model OMO (agents + categories)
+  3. ~/.config/opencode/agents/*.md     → agent custom (frontmatter model)
+
+Backup otomatis      : ~/.config/opencode/backups/ (+ omo.jsonc ikut dibackup)
 Preset tersimpan     : ~/.config/opencode/omo-agent-presets.json
 """
 
@@ -23,10 +27,15 @@ def config_dir() -> str:
         os.path.expanduser("~"), ".config", "opencode"
     )
 
+def omo_jsonc_path() -> str:
+    return os.environ.get("CHAGENT_OMO_JSONC") or os.path.join(
+        os.path.expanduser("~"), ".omo", "omo.jsonc"
+    )
+
 CONFIG_PATH = lambda: os.path.join(config_dir(), "opencode.json")          # noqa: E731
 BACKUP_DIR = lambda: os.path.join(config_dir(), "backups")                 # noqa: E731
 PRESET_PATH = lambda: os.path.join(config_dir(), "omo-agent-presets.json")  # noqa: E731
-MODELS_CACHE = lambda: os.path.join(config_dir(), ".omo-models-cache.txt")  # noqa: E731
+MODELS_CACHE = lambda: os.path.join(config_dir(), ".chagent-models-cache.txt")  # noqa: E731
 AGENTS_MD_DIR = lambda: os.path.join(config_dir(), "agents")               # noqa: E731
 
 MAX_BACKUPS = 30
@@ -37,6 +46,13 @@ KNOWN_AGENTS = [
     "build", "plan", "general", "explore", "deep",
     "metis", "momus", "multimodal-looker", "oracle", "librarian",
     "atlas", "hephaestus", "prometheus", "Sisyphus-Junior", "sisyphus",
+]
+
+# Category-agent OMO: model-nya HANYA bisa diatur lewat omo.jsonc.categories,
+# opencode.json tidak berpengaruh untuk spawn berbasis category.
+KNOWN_CATEGORIES = [
+    "visual-engineering", "ultrabrain", "deep", "artistry", "quick",
+    "unspecified-low", "unspecified-high", "writing",
 ]
 
 DEFAULT_PRESETS = {
@@ -174,6 +190,152 @@ def make_backup(reason="manual"):
         except OSError:
             pass
     return dst
+
+
+# ---------------------------------------------------------------- JSONC helpers (omo.jsonc) — string-aware
+
+def strip_jsonc(text: str) -> str:
+    """Strip // and /* */ comments tapi JANGAN rusak URL di dalam string."""
+    out, i, n, in_str, esc = [], 0, len(text), False, False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def load_omo():
+    p = omo_jsonc_path()
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = f.read()
+        return json.loads(strip_jsonc(raw))
+    except Exception as e:
+        err(f"omo.jsonc rusak/tidak valid: {e}")
+        warn("Perbaiki manual dulu — backup otomatis tetap dibuat sebelum tulis ulang.")
+        return None
+
+
+def save_omo(omo):
+    p = omo_jsonc_path()
+    os.makedirs(BACKUP_DIR(), exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    if os.path.exists(p):
+        shutil.copy2(p, os.path.join(BACKUP_DIR(), f"omo.jsonc.{ts}.auto.bak"))
+        # prune omo backup lama (keep 30)
+        backups = sorted(f for f in os.listdir(BACKUP_DIR()) if f.startswith("omo.jsonc."))
+        for old in backups[:-MAX_BACKUPS]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR(), old))
+            except OSError:
+                pass
+    tmp = p + ".tmp"
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(omo, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    with open(tmp, encoding="utf-8") as f:
+        json.load(f)
+    os.replace(tmp, p)
+    ok(f"Tersimpan → {p} " + colored("(komentar JSONC hilang — backup aman)", "dim"))
+
+
+def set_model_everywhere(name: str, model: str, cfg: dict) -> None:
+    """Tulis model ke 3 lapisan: opencode.json + omo.jsonc agents/categories + .md frontmatter."""
+    # Lapisan 1: opencode.json
+    cfg.setdefault("agent", {})
+    entry = cfg["agent"].get(name)
+    if isinstance(entry, dict):
+        entry["model"] = model
+    else:
+        cfg["agent"][name] = {"model": model}
+    # Lapisan 2: omo.jsonc agents & categories
+    omo = load_omo()
+    if omo is None:
+        # corrupt — jangan timpa, tapi opencode.json tetap tersimpan oleh caller
+        warn("omo.jsonc corrupt — skip sinkronisasi OMO untuk kali ini.")
+        return
+    # omo bisa {} kalau file belum ada — buat struktur minimal
+    oc = omo.get("[opencode]")
+    if not isinstance(oc, dict):
+        # kalau file kosong atau belum ada [opencode], jangan buat dari nol kecuali ada agents/categories yang dikenali
+        # tetap buat agar pin konsisten
+        oc = omo.setdefault("[opencode]", {})
+    for section in ("agents", "categories"):
+        sec = oc.setdefault(section, {})
+        ent = sec.get(name)
+        if isinstance(ent, dict):
+            ent["model"] = model
+        elif name in sec or name in KNOWN_CATEGORIES or name in KNOWN_AGENTS:
+            sec[name] = {"model": model}
+        # kalau name tidak ada di section dan bukan known, jangan buat — biar tidak spam
+    # hanya save jika ada perubahan (sudah ada oc)
+    # simpan omo.jsonc — caller yang akan save_config(cfg) terpisah
+    # kita save omo di sini langsung
+    # cek apakah omo punya [opencode] yang baru diisi
+    if oc:
+        save_omo(omo)
+    # Lapisan 3: frontmatter .md — dilakukan terpisah di action_change_one agar bisa backup .md.bak
+    # (jangan di sini supaya tidak double-IO saat preset loop banyak agent)
+
+
+def edit_md_frontmatter_model(name: str, model: str) -> bool:
+    """Edit baris model: di file agents/<name>.md jika ada. Return True jika diubah."""
+    md_path = os.path.join(AGENTS_MD_DIR(), f"{name}.md")
+    if not os.path.exists(md_path):
+        return False
+    try:
+        with open(md_path, encoding="utf-8") as f:
+            content = f.read()
+        # cari frontmatter block --- ... ---
+        m = re.match(r"(\s*---\s*\n)(.*?)(\n---)", content, re.S)
+        if not m:
+            return False
+        fm = m.group(2)
+        if re.search(r"^model:\s*.+$", fm, re.M):
+            new_fm = re.sub(r"^model:\s*.+$", f"model: {model}", fm, count=1, flags=re.M)
+        else:
+            # belum ada baris model — sisipkan setelah baris pertama frontmatter
+            new_fm = f"model: {model}\n" + fm
+        if new_fm == fm:
+            return False
+        new_content = content[:m.start(2)] + new_fm + content[m.end(2):]
+        # backup .md
+        shutil.copy2(md_path, md_path + ".bak")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        ok(f"Frontmatter {name}.md → {model}")
+        return True
+    except Exception as e:
+        warn(f"Gagal edit {name}.md: {e}")
+        return False
 
 
 # ---------------------------------------------------------------- presets
@@ -321,6 +483,7 @@ def show_agents(cfg):
             print(f"   • {name.ljust(width)}{colored(str(model), 'y')}{mark}")
     else:
         warn("Belum ada override agent sama sekali.")
+        width = 18
 
     md_dir = AGENTS_MD_DIR()
     if os.path.isdir(md_dir):
@@ -331,12 +494,49 @@ def show_agents(cfg):
             for f in mds:
                 name, model, desc = read_md_agent(os.path.join(md_dir, f))
                 extra = f"  {colored('# ' + desc, 'dim')}" if desc else ""
+                # width already set above
                 print(f"   • {name.ljust(width)}{colored(str(model or '(ikut global)'), 'y')}{extra}")
 
     untouched = [a for a in KNOWN_AGENTS if a not in agents]
     if untouched:
         print()
         print(colored(f"  Belum di-override (ikut global): {', '.join(untouched)}", "dim"))
+
+    # ----- Pin OMO (lapisan 2) -----
+    omo = load_omo()
+    if omo is None:
+        print()
+        print(colored("  Pin OMO (~/.omo/omo.jsonc):", "bold") + colored("  ⚠ file rusak — perbaiki manual", "r"))
+    elif not omo:
+        print()
+        print(colored("  Pin OMO (~/.omo/omo.jsonc):", "bold") + colored("  (tidak ada file — akan dibuat saat ganti model)", "dim"))
+    else:
+        oc = omo.get("[opencode]", {})
+        if isinstance(oc, dict) and (oc.get("agents") or oc.get("categories")):
+            print()
+            print(colored("  Pin OMO (~/.omo/omo.jsonc):", "bold"))
+            # agents pin
+            omo_agents = oc.get("agents", {}) if isinstance(oc.get("agents"), dict) else {}
+            if omo_agents:
+                print(colored("    agents:", "dim"))
+                for k, v in sorted(omo_agents.items()):
+                    m = v.get("model", "?") if isinstance(v, dict) else str(v)
+                    # cek konflik vs opencode.json
+                    op_m = (agents.get(k) or {}).get("model") if isinstance(agents.get(k), dict) else None
+                    flag = ""
+                    if op_m and op_m != m:
+                        flag = colored(f"  ⚠ beda vs opencode.json ({op_m})", "r")
+                    print(f"     • {k.ljust(width)}{colored(str(m), 'y')}{flag}")
+            # categories pin
+            omo_cats = oc.get("categories", {}) if isinstance(oc.get("categories"), dict) else {}
+            if omo_cats:
+                print(colored("    categories:", "dim"))
+                for k, v in sorted(omo_cats.items()):
+                    m = v.get("model", "?") if isinstance(v, dict) else str(v)
+                    print(f"     • {k.ljust(width)}{colored(str(m), 'y')}")
+        else:
+            print()
+            print(colored("  Pin OMO (~/.omo/omo.jsonc):", "bold") + colored("  (tidak ada pin agents/categories)", "dim"))
     print()
 
 
@@ -346,6 +546,11 @@ def action_change_one(cfg):
     agents = cfg.setdefault("agent", {})
     names = sorted(set(list(agents.keys())))
     options = names + [a for a in KNOWN_AGENTS if a not in names]
+    # also add categories that are not yet in options so user can pick e.g. artistry/quick
+    for cat in KNOWN_CATEGORIES:
+        if cat not in options:
+            options.append(cat)
+    options = sorted(set(options))
     cur = {n: (agents.get(n) or {}).get("model", "(belum di-override)") for n in options}
 
     i = pick_numbered(options, "GANTI MODEL SATU AGENT",
@@ -358,13 +563,11 @@ def action_change_one(cfg):
         warn("Batal.")
         return
     old = cur[name]
-    entry = agents.get(name)
-    if isinstance(entry, dict):
-        entry["model"] = model
-    else:
-        agents[name] = {"model": model}
+    set_model_everywhere(name, model, cfg)
+    # layer 3: .md frontmatter if exists
+    md_changed = edit_md_frontmatter_model(name, model)
     save_config(cfg)
-    ok(f"{name}: {old} → {colored(model, 'g', 'bold')}")
+    ok(f"{name}: {old} → {colored(model, 'g', 'bold')}" + (colored(" (+ .md)", "dim") if md_changed else ""))
     warn("Restart sesi opencode biar efek.")
 
 
@@ -384,7 +587,7 @@ def action_preset(cfg):
     if untouched:
         choice = ask(
             f"  Ada {len(untouched)} agent OMO belum di-override. "
-            "[1] Hapus yang di config saja  [2] Sekalian tambahkan semuanya", "1")
+            "[1] Hanya yang di config saja  [2] Sekalian tambahkan semuanya", "1")
         scope = 2 if choice == "2" else 1
     if not confirm(f"  Yakin terapkan '{pname}'?"):
         warn("Batal.")
@@ -393,15 +596,28 @@ def action_preset(cfg):
     targets = list(agents.keys())
     if scope == 2:
         targets += untouched
+    # also include categories for full sync
+    cat_targets = list(KNOWN_CATEGORIES)
     for name in targets:
-        entry = agents.get(name)
-        if isinstance(entry, dict):
-            entry["model"] = pmodel
-        else:
-            agents[name] = {"model": pmodel}
-    cfg["agent"] = agents
+        set_model_everywhere(name, pmodel, cfg)
+        edit_md_frontmatter_model(name, pmodel)
+    # also repin categories that are not in targets (e.g. quick/artistry jika belum di targets)
+    omo = load_omo()
+    if omo is not None and isinstance(omo.get("[opencode]"), dict):
+        oc = omo["[opencode]"]
+        for cat in cat_targets:
+            sec = oc.setdefault("categories", {})
+            ent = sec.get(cat)
+            if isinstance(ent, dict):
+                ent["model"] = pmodel
+            else:
+                sec[cat] = {"model": pmodel}
+        # also ensure agents section covers all targets already via set_model_everywhere, but categories extra handled
+        save_omo(omo)
+    # md for categories typically no file, so ignore
+    cfg["agent"] = cfg.get("agent", {})
     save_config(cfg)
-    ok(f"{len(targets)} agent sekarang pakai '{pmodel}'")
+    ok(f"{len(targets)} agent + {len(cat_targets)} categories sekarang pakai '{pmodel}'")
     warn("Restart sesi opencode biar efek.")
 
 
@@ -459,9 +675,10 @@ def action_add_agent(cfg):
     model = pick_model(cfg)
     if not model:
         return warn("Batal.")
-    cfg.setdefault("agent", {})[name] = {"model": model}
+    set_model_everywhere(name, model, cfg)
+    edit_md_frontmatter_model(name, model)
     save_config(cfg)
-    ok(f"Override '{name}' → {model} ditambahkan.")
+    ok(f"Override '{name}' → {model} ditambahkan (sinkron ke OMO).")
 
 
 def action_remove_agent(cfg):
@@ -477,6 +694,7 @@ def action_remove_agent(cfg):
         del cfg["agent"][name]
         save_config(cfg)
         ok(f"'{name}' dihapus dari override.")
+        warn("Catatan: pin OMO untuk agent ini TIDAK otomatis dihapus — pakai menu 10 repin jika perlu.")
 
 
 def action_global_model(cfg):
@@ -492,6 +710,23 @@ def action_global_model(cfg):
         cfg["small_model"] = model
     save_config(cfg)
     ok(f"model → {model}" + (f", small_model → {model}" if apply_small else ""))
+    if confirm("  Repin SEMUA pin OMO (agents+categories) ke model ini juga?", default_yes=False):
+        omo = load_omo()
+        if omo is None:
+            warn("omo.jsonc rusak — skip repin.")
+        elif not omo:
+            warn("Tidak ada omo.jsonc — skip.")
+        else:
+            oc = omo.get("[opencode]", {})
+            if isinstance(oc, dict):
+                for section in ("agents", "categories"):
+                    sec = oc.get(section, {})
+                    if isinstance(sec, dict):
+                        for k, v in sec.items():
+                            if isinstance(v, dict):
+                                v["model"] = model
+                save_omo(omo)
+                ok("Semua pin OMO ikut di-repin.")
 
 
 def action_backup_restore(cfg):
@@ -539,6 +774,37 @@ def action_refresh_catalog():
     ok(f"Katalog segar: {len(models)} model ter-cache.")
 
 
+def action_repin_omo(cfg):
+    header("SAMAKAN SEMUA PIN OMO")
+    omo = load_omo()
+    if omo is None:
+        err("omo.jsonc rusak — perbaiki manual dulu.")
+        return
+    if not omo:
+        warn("Belum ada omo.jsonc — akan dibuat dengan pin minimal.")
+        omo = {"[opencode]": {"agents": {}, "categories": {}}}
+    oc = omo.get("[opencode]", {})
+    if not isinstance(oc, dict):
+        oc = {}
+        omo["[opencode]"] = oc
+    total = sum(len(oc.get(s, {})) if isinstance(oc.get(s), dict) else 0 for s in ("agents", "categories"))
+    print(f"  Pin saat ini: {total} entri (agents+categories)")
+    model = pick_model(cfg)
+    if not model:
+        return warn("Batal.")
+    if not confirm(f"  Repin SEMUA {total} pin OMO ke {model}?", default_yes=True):
+        return warn("Batal.")
+    for section in ("agents", "categories"):
+        sec = oc.setdefault(section, {})
+        if isinstance(sec, dict):
+            for k, v in sec.items():
+                if isinstance(v, dict):
+                    v["model"] = model
+    save_omo(omo)
+    ok(f"Semua {total} pin OMO → {model}")
+    warn("Restart sesi opencode biar efek.")
+
+
 # ---------------------------------------------------------------- main
 
 MENU = [
@@ -551,6 +817,7 @@ MENU = [
     ("Ganti model GLOBAL (model/small_model)", action_global_model),
     ("Backup & restore config",         action_backup_restore),
     ("Refresh katalog model",           lambda c: action_refresh_catalog()),
+    ("Samakan SEMUA pin OMO ke satu model", action_repin_omo),
 ]
 
 
